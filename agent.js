@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Headless Beagle voice agent: werift WebRTC + peer-webrtc CallEngine over the beagle daemon.
+// Noor: headless Beagle voice agent (Wei's assistant). werift WebRTC + peer-webrtc CallEngine over the beagle daemon.
+// Adapted from Rio's public prototype — see UPSTREAM.md.
 // Media is RELAY-ONLY via existing TURN (UDP preferred); no host/srflx candidates.
 import fs from 'node:fs';
 import path from 'node:path';
@@ -39,7 +40,7 @@ async function makeEngine() {
   const src = makeAudioSource();
   const signaling = new DaemonSignaling(BASE, log);
   const engine = new PW.CallEngine({
-    selfId: 'Rio', signaling,
+    selfId: process.env.AGENT_NAME || 'Noor', signaling,
     createPeerConnection: relayOnlyPeerConnectionFactory(relay, log),
     getLocalMedia: async () => src.stream,
     iceServers: relay,
@@ -52,7 +53,7 @@ async function makeEngine() {
 
 async function cmdCall(peer) {
   const hold = +opt('hold', 60) * 1000;
-  const packets = opt('play') ? fileToOpusPackets(opt('play')) : textToOpusPackets(opt('say', 'Hi, this is Rio calling on Beagle.'), opt('lang', 'en'));
+  const packets = opt('play') ? fileToOpusPackets(opt('play')) : textToOpusPackets(opt('say', 'Hi, this is Noor, Wei\'s assistant, calling on Beagle.'), opt('lang', 'en'));
   log(`prepared ${packets.length} opus frames (${(packets.length * 0.02).toFixed(1)} s)`);
   const { engine, src, signaling } = await makeEngine();
   let stopRec = () => null, done;
@@ -67,7 +68,7 @@ async function cmdCall(peer) {
 }
 
 async function cmdListen() {
-  const reply = opt('say', "Hi, this is Rio, Wei's agent on Beagle. I can hear you; I'm recording what you say.");
+  const reply = opt('say', "Hi, this is Noor, Wei\'s assistant on Beagle. I can hear you; I\'m recording what you say.");
   const packets = textToOpusPackets(reply, opt('lang', 'en'));
   const { engine, src } = await makeEngine();
   const allow = await friends();

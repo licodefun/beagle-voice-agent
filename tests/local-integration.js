@@ -9,7 +9,7 @@ const backend=new LocalBackend({log:(...a)=>fs.appendFileSync('out/integration-w
 const report={};const pcm=wav=>execFileSync('ffmpeg',['-v','error','-i','pipe:0','-ac','1','-ar','16000','-f','s16le','pipe:1'],{input:wav,maxBuffer:2e6});
 try {
  await backend.ready;
- for(const [language,text,expected] of [['en','Hello Rio. My name is Wei. Can you hear me clearly?',/hello|hear|name|wei/i],['zh','你好，我是李伟。你能听到我说话吗？',/[你好听说我]/]]) {
+ for(const [language,text,expected] of [['en','Hello Noor. My name is Wei. Can you hear me clearly?',/hello|hear|name|wei/i],['zh','你好，我是李伟。你能听到我说话吗？',/[你好听说我]/]]) {
   const tts=await backend.request({op:'tts',text,language});assert(tts.wav);fs.writeFileSync(`out/test-tts-${language}.wav`,Buffer.from(tts.wav,'base64'));
   const asr=await backend.request({op:'asr',pcm:pcm(Buffer.from(tts.wav,'base64')).toString('base64'),language});assert.match(asr.text,expected);report[language]={input:text,transcript:asr.text,elapsedMs:asr.elapsedMs};
  }

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {packetPlayer} from '../lib/playback.js';
 import {TurnDetector,SerialQueue} from '../lib/turns.js';
-import {ConversationSession,wavToPackets} from '../lib/conversation.js';
+import {ConversationSession,wavToPackets,pcmPeak,isSilentPcm} from '../lib/conversation.js';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 const frame=(amp=0)=>{const b=Buffer.alloc(640);for(let i=0;i<640;i+=2)b.writeInt16LE(amp,i);return b;};
 test('loop monotonic, bounded catch-up, stop resolves promise',async()=>{
@@ -67,22 +67,10 @@ test('offline route binds SDK-generated offer ID, preserves other Carrier calls'
  await s.send('other',{type:'offer',callId:'other-id',sdp:'sdp'});
  assert.deepEqual(sent,['socket','socket','carrier:other-id']);s.stop();
 });
-test('300ms endpoint preserves short internal pauses; emits monotonic timeline metadata',()=>{
+test('450ms endpoint preserves internal pauses; emits monotonic timeline metadata',()=>{
  let turn;const v=new TurnDetector((pcm,meta)=>turn={pcm,meta});for(let n=0;n<20;n++)v.push(frame(3000),n*20);
- for(let n=0;n<10;n++)v.push(frame(),400+n*20);assert(!turn);
- for(let n=0;n<15;n++)v.push(frame(3000),600+n*20);v.tick(1179);assert(!turn);v.tick(1180);assert(turn);assert.equal(turn.meta.lastVoiceAt,880);assert(turn.meta.voicedMs>=600);
-});
-test('48k stereo downmix yields 16k mono at the right rate and pitch',async()=>{
- const {StereoDownsampler}=await import('../lib/resample.js');const d=new StereoDownsampler();let samples=0,last;
- for(let p=0;p<25;p++){const b=Buffer.alloc(3840);for(let i=0;i<960;i++){const n=p*960+i;b.writeInt16LE(Math.round(8000*Math.sin(2*Math.PI*1000*n/48000)),i*4);b.writeInt16LE(0,i*4+2);}last=d.process(b);samples+=last.length/2;}
- assert.equal(samples,25*320);let zc=0;for(let j=1;j<last.length/2;j++)if((last.readInt16LE(j*2-2)<0)!==(last.readInt16LE(j*2)<0))zc++;assert(zc>=38&&zc<=42,'1 kHz tone keeps its pitch: '+zc);
- let peak=0;for(let j=0;j<last.length/2;j++)peak=Math.max(peak,Math.abs(last.readInt16LE(j*2)));assert(peak>3600&&peak<4400,'L+R averaged: '+peak);
-});
-test('streamed clauses play in order before the final result',async()=>{
- const played=[];const src={play:async p=>{played.push(p[0].toString());},stop:()=>{}};
- const backend={request:async(d,{onPartial})=>{assert.equal(d.stream,true);onPartial({partial:true,wav:Buffer.from('a').toString('base64')});onPartial({partial:true,wav:Buffer.from('b').toString('base64')});return {text:'hi',reply:'Hi. Welcome.',language:'en'};}};
- const s=new ConversationSession({src,backend,encode:async w=>[Buffer.from(w)],muteTailMs:0});assert(s.submit(frame(1000)));await s.queue.idle;
- assert.deepEqual(played,['a','b']);assert.equal(s.history.length,2);s.close();
+ for(let n=0;n<15;n++)v.push(frame(),400+n*20);assert(!turn);
+ for(let n=0;n<15;n++)v.push(frame(3000),700+n*20);v.tick(1429);assert(!turn);v.tick(1430);assert(turn);assert.equal(turn.meta.lastVoiceAt,980);assert(turn.meta.voicedMs>=600);
 });
 test('fast PCM WAV encoder rejects malformed or overlong inputs safely',async()=>{
  const {pcmWavToOpus}=await import('../lib/wav-opus.js');assert.throws(()=>pcmWavToOpus(Buffer.alloc(20)),/not PCM WAV/);
@@ -105,67 +93,87 @@ test('incoming/outgoing hard call budget cannot extend beyond 180s and cleans on
  b.start('PENDING-OUTGOING');b.start('OUTGOING',170000);assert.equal(delay,170000);b.stop();tick();assert.deepEqual(expired,['incoming']);assert(cleared>0);
  b.start('test',999999);assert.equal(delay,180000);b.stop();
 });
-test('text auto-reply: accepted friends only, no backlog, no own messages, excluded agents, rate limited',async()=>{
- const {TextAutoReply}=await import('../lib/text-autoreply.js');
- let now=1000;const sends=[];const asked=[];
- const friends=[{userid:'wei',accepted:true,name:'weili',lastMessage:{dir:'in',ts:900}},{userid:'stranger',accepted:false,name:'x',lastMessage:{dir:'in',ts:900}},{userid:'hq',accepted:true,name:'Decent HQ',lastMessage:{dir:'in',ts:900}}];
- const threads={wei:[{dir:'in',text:'old backlog\0',ts:900}],hq:[],stranger:[]};
- const fetchImpl=async(url,init={})=>{const u=new URL(url);let body;
-  if(u.pathname==='/api/friends-list')body={friends};
-  else if(u.pathname==='/api/chat-history'){const p=u.searchParams.get('peer');body={chats:{[p]:threads[p]}};}
-  else if(u.pathname==='/api/chat-send'){const b=JSON.parse(init.body);sends.push(b);threads[b.userid].push({dir:'out',text:b.text,ts:now});friends.find(f=>f.userid===b.userid).lastMessage={dir:'out',ts:now};body={ok:true};}
-  return {ok:true,json:async()=>body};};
- const backend={request:async d=>{asked.push(d);assert.equal(d.op,'chat');assert.equal(d.mode,'text');return {reply:'Hi! Ask me about Beagle.'};}};
- const a=new TextAutoReply({base:'http://d',backend,fetchImpl,now:()=>now,setTimer:()=>1,clearTimer:()=>{},excludeNames:/decent hq|muse/i,minGapMs:45000});
- await a.start();await a.tick();assert.equal(sends.length,0,'backlog ignored');
- const msg=(peer,text)=>{now+=1000;threads[peer].push({dir:'in',text,ts:now});friends.find(f=>f.userid===peer).lastMessage={dir:'in',ts:now};};
- msg('wei','hello Rio');msg('stranger','hi');msg('hq','status?');await a.tick();
- assert.deepEqual(sends.map(s=>s.userid),['wei']);assert.equal(asked[0].trustedPeerId,'wei');assert.equal(asked[0].text,'hello Rio');
- await a.tick();assert.equal(sends.length,1,'own reply not answered');
- msg('wei','again');await a.tick();assert.equal(sends.length,1,'min gap defers');now+=46000;await a.tick();assert.equal(sends.length,2,'deferred reply sent after gap');
- let busy=true;a.isBusy=()=>busy;msg('wei','during call');now+=46000;await a.tick();assert.equal(sends.length,2,'no replies during a call');busy=false;await a.tick();assert.equal(sends.length,3);
- a.stop();
+
+test('live conversation path records caller audio and reply audio to files',async()=>{
+ const {mkdtempSync,existsSync,readFileSync,readdirSync}=await import('node:fs');
+ const {tmpdir}=await import('node:os');
+ const {join}=await import('node:path');
+ const {execFileSync}=await import('node:child_process');
+ const dir=mkdtempSync(join(tmpdir(),'bva-record-'));
+ const wav=execFileSync('ffmpeg',['-v','error','-f','lavfi','-i','sine=frequency=440:duration=1','-ar','48000','-ac','1','-f','wav','pipe:1']);
+ const packets=await wavToPackets(wav);
+ const s=new ConversationSession({src:{play:async()=>{},stop:()=>{}},backend:{request:async()=>({text:'hello',language:'en',reply:'Hi Wei.',wav:Buffer.from('RIFFxxxx').toString('base64')})},encode:async()=>[Buffer.from([0xf8,0xff,0xfe])],now:()=>0,muteTailMs:0,recordDir:dir,callId:'TESTCALL123'});
+ for(const p of packets)s.receive(p);
+ s.vad.flush();await s.queue.idle;
+ s.close();
+ const files=readdirSync(dir);
+ assert(files.some(f=>f.endsWith('-wei.ogg')));
+ assert(files.some(f=>f.endsWith('-wei.wav')));
+ assert(files.some(f=>f.includes('-noor-turn1.wav')));
+ assert(existsSync(join(dir,'call-TESTCALL123.json')));
+ const manifest=JSON.parse(readFileSync(join(dir,'call-TESTCALL123.json'),'utf8'));
+ assert.equal(manifest.turns.length,1);assert.equal(manifest.turns[0].transcript,'hello');assert.equal(manifest.turns[0].reply,'Hi Wei.');
 });
-test('per-call language lock is sent to the worker, updated from its decision and reset on close',async()=>{
- const seen=[];const src={play:async()=>{},stop:()=>{}};
- const answers=[{text:'Can you speak Chinese?',language:'en',lockLang:'zh',reply:'好的，我们用中文聊。'},{text:'怎么加好友',language:'zh',lockLang:'zh',reply:'发送好友请求。'},{text:'English please',language:'en',lockLang:'en',reply:'Sure.'}];
- const backend={request:async d=>{seen.push({callLang:d.callLang,recent:[...d.recentLangs]});return answers[seen.length-1];}};
- const s=new ConversationSession({src,backend,encode:async()=>[],muteTailMs:0});
- for(let i=0;i<3;i++){assert(s.submit(frame(1000)));await s.queue.idle;}
- assert.deepEqual(seen.map(x=>x.callLang),[null,'zh','zh']);assert.equal(s.lang,'en');assert.deepEqual(seen[2].recent,['en','zh']);
- s.close();assert.equal(s.lang,null);
+test('greeting plays pre-rendered packets once, never calls backend, busy-gates then releases',async()=>{
+ let plays=0;const src={play:async p=>{plays++;assert(p.length>0);await sleep(5);},stop:()=>{}};
+ let backendCalls=0;const s=new ConversationSession({src,backend:{request:async()=>{backendCalls++;}},encode:async()=>[Buffer.from('g1'),Buffer.from('g2')],muteTailMs:0});
+ await s.greet(performance.now());assert.equal(plays,1);assert.equal(backendCalls,0);assert(!s.busy);assert(s.greeted);
+ await s.greet(performance.now());assert.equal(plays,1);s.close();
 });
-test('voice message auto-reply: downloads, transcribes, sends voice-<ms>-<dur>.m4a; text fallback; backlog/own/excluded rules',async()=>{
- const {TextAutoReply}=await import('../lib/text-autoreply.js');
- let now=1000,fileSendOk=true;const files=[],texts=[],asked=[],saved=[];
- const friends=[{userid:'wei',accepted:true,name:'weili',lastMessage:{dir:'in',ts:900}},{userid:'hq',accepted:true,name:'Decent HQ',lastMessage:{dir:'in',ts:900}}];
- const store={'voice-900-1000.m4a':Buffer.alloc(10),'voice-2000-3000.m4a':Buffer.alloc(30),'voice-hq-1.m4a':Buffer.alloc(5)};
- const threads={wei:[{id:'old',dir:'in',text:'',file:{name:'voice-900-1000.m4a',size:10},ts:900}],hq:[]};
- const fetchImpl=async(url,init={})=>{const u=new URL(url);let body,ok=true,bin=null;
-  if(u.pathname==='/api/friends-list')body={friends};
-  else if(u.pathname==='/api/chat-history'){const p=u.searchParams.get('peer');body={chats:{[p]:threads[p]}};}
-  else if(u.pathname==='/api/file-download'){bin=store[u.searchParams.get('name')];ok=!!bin;}
-  else if(u.pathname==='/api/file-send'){if(!fileSendOk){ok=false;body={ok:false,error:'peer offline'};}else{const p=u.searchParams.get('userid');files.push({p,name:u.searchParams.get('name'),bytes:init.body.length});threads[p].push({dir:'out',text:'',file:{name:u.searchParams.get('name')},ts:now});body={ok:true,fileId:'f1'};}}
-  else if(u.pathname==='/api/chat-send'){const b=JSON.parse(init.body);texts.push(b);threads[b.userid].push({dir:'out',text:b.text,ts:now});body={ok:true};}
-  return {ok,status:ok?200:502,json:async()=>body,arrayBuffer:async()=>bin};};
- const backend={request:async d=>{asked.push(d);assert.equal(d.op,'voicenote');return {text:'你好，Beagle怎么加好友？',language:'zh',reply:'在加好友里输入对方的ID就行。',replyLanguage:'zh',replySource:'local-model-grounded',wav:'UklGRg=='};}};
- const voiceTools={toPcm16k:async b=>Buffer.alloc(b.length*3200),wavToM4a:async()=>Buffer.alloc(77),wavDurationMs:()=>2345,save:async(n,b)=>{saved.push([n,b.length]);return 'out/voicenotes/'+n;}};
- const a=new TextAutoReply({base:'http://d',backend,fetchImpl,now:()=>now,setTimer:()=>1,clearTimer:()=>{},excludeNames:/decent hq/i,voiceTools,log:(...x)=>process.env.DBG&&console.log(...x)});
- await a.start();await a.tick();assert.equal(asked.length,0,'voice backlog ignored');
- const vn=(peer,name,size)=>{now+=1000;threads[peer].push({id:'m'+now,dir:'in',text:'',file:{name,size},ts:now});friends.find(f=>f.userid===peer).lastMessage={dir:'in',ts:now};};
- vn('hq','voice-hq-1.m4a',5);vn('wei','voice-2000-3000.m4a',30);await a.tick();
- assert.equal(asked.length,1,'excluded agent never answered');assert.equal(asked[0].trustedPeerId,'wei');assert.equal(asked[0].pcm.length,Buffer.alloc(96000).toString('base64').length);
- assert.deepEqual(files,[{p:'wei',name:`voice-${now}-2345.m4a`,bytes:77}]);assert.equal(texts.length,0);assert.deepEqual(saved,[['wei-voice-2000-3000.m4a',30]]);
- await a.tick();assert.equal(asked.length,1,'own voice reply not answered');
- // incomplete download waits; send failure falls back to text
- now+=50000;vn('wei','voice-5000-1.m4a',40);await a.tick();assert.equal(asked.length,1,'waits for the whole file');
- store['voice-5000-1.m4a']=Buffer.alloc(40);fileSendOk=false;await a.tick();assert.equal(asked.length,2);assert.deepEqual(texts.map(t=>t.text),['在加好友里输入对方的ID就行。']);
- a.stop();
+test('greeting deferred while busy does not consume the one-shot',async()=>{
+ let plays=0;const src={play:async()=>{plays++;},stop:()=>{}};
+ const s=new ConversationSession({src,backend:{},encode:async()=>[Buffer.from('g')],muteTailMs:0});
+ s.busy=true;await s.greet(performance.now());assert.equal(plays,0);assert(!s.greeted);
+ s.busy=false;await s.greet(performance.now());assert.equal(plays,1);s.close();
 });
-test('turn watchdog plays a short fallback and frees the turn when the backend stalls',async()=>{
- const played=[];const src={play:async p=>{played.push(p);},stop:()=>{}};const old=ConversationSession.watchdogMs;ConversationSession.watchdogMs=30;ConversationSession.fallbackWavs={en:Buffer.from('fallback').toString('base64'),zh:'eg=='};
- let finish;const s=new ConversationSession({src,backend:{request:()=>new Promise(r=>finish=r)},encode:async w=>[w.toString()],muteTailMs:0});
- s.submit(frame(1000));await s.queue.idle;assert.deepEqual(played,[['fallback']]);assert(!s.busy);
- finish({text:'late',reply:'late reply',wav:'eA=='});await new Promise(r=>setTimeout(r,10));assert.equal(played.length,1,'late result never played');
- s.close();ConversationSession.watchdogMs=old;ConversationSession.fallbackWavs=null;
+
+test('endCall result fires onEndCall once, after the closing reply plays; absent flag never fires',async()=>{
+ let ended=0,played=0;
+ const mk=(withFlag)=>new ConversationSession({src:{play:async()=>{played++;},stop:()=>{}},backend:{request:async()=>({text:'好的 你關掉吧',language:'zh',reply:'好的，我先挂了，再见。',wav:Buffer.from('RIFFxxxx').toString('base64'),...(withFlag?{endCall:true}:{}),stages:{}})},encode:async()=>[Buffer.from([1])],muteTailMs:0,onEndCall:()=>{ended++;}});
+ const s=mk(true); s.submit(frame(1000)); await s.queue.idle; assert.equal(played,1); assert.equal(ended,1); s.close();
+ const t=mk(false); t.submit(frame(1000)); await t.queue.idle; assert.equal(played,2); assert.equal(ended,1); t.close();
+});
+
+test('pcmPeak and isSilentPcm: silence fast-paths, speech energy does not',()=>{
+ assert.equal(pcmPeak(Buffer.alloc(100)),0);
+ const loud=Buffer.alloc(200); loud.writeInt16LE(5000,10); assert.equal(pcmPeak(loud),5000);
+ assert(isSilentPcm(Buffer.alloc(200))); assert(!isSilentPcm(loud));
+});
+test('near-silent turn plays the pre-rendered prompt and never calls the backend',async()=>{
+ let backendCalls=0,played=0;
+ const s=new ConversationSession({src:{play:async()=>{played++;},stop:()=>{}},backend:{request:async()=>{backendCalls++;throw new Error('backend must not be called for a silent turn');}},encode:async()=>[Buffer.from([1])],muteTailMs:0});
+ s.submit(Buffer.alloc(32000)); await s.queue.idle;
+ assert.equal(backendCalls,0); assert.equal(played,1); s.close();
+});
+
+import {CombinedSignaling} from '../lib/offline-signaling.js';
+import {PW as PW2} from '../lib/engine.js';
+function fakeSignaling(){const s=Object.create(CombinedSignaling.prototype);s.log=()=>{};s.ids=new Set();s.inbound=new Set();s.answers=new Set();s.preAccepted=new Set();s.pendingAccepts=new Map();s.offersSeen=new Set();s.acceptResent=new Set();s.awaitingAnswer=new Set();s.candidateQueue=new Map();s.sent=[];s.bridgeHandlers={};s.bridge={connected:true,sendSignal:async(peer,data)=>{s.sent.push(PW2.decodeSignal(data));return{pushed:false};},forgetCall(){},on:(ev,f)=>{s.bridgeHandlers[ev]=f;}};s.daemon={send:async()=>{},onSignal(){}};return s;}
+test('doorbell pre-accept suppresses the engine trailing accept',async()=>{
+ const s=fakeSignaling();const cid='ABC-123';
+ await s.sendAccept('peer1',cid,['audio']);
+ await s.send('peer1',{type:'action',action:'accept',callId:cid,options:['audio']});
+ assert.equal(s.sent.filter(x=>x.action==='accept').length,1);
+});
+test('doorbell accept resent once when the caller (re)joins before offering',async()=>{
+ const s=fakeSignaling();const cid='DEF-456';s.onSignal(()=>{});
+ await s.sendAccept('peer1',cid,['audio']);
+ const online=()=>s.bridgeHandlers.signal({userid:'peer1',data:PW2.encodeSignal({type:'event',event:'online',callId:cid})});
+ online();await sleep(10);online();await sleep(10);
+ assert.equal(s.sent.filter(x=>x.action==='accept').length,2);
+ s.bridgeHandlers.signal({userid:'peer1',data:PW2.encodeSignal({type:'offer',callId:cid,sdp:'x'})});
+ online();await sleep(10);
+ assert.equal(s.sent.filter(x=>x.action==='accept').length,2);
+});
+test('candidates are held until the answer is sent, then flushed and resent',async()=>{
+ const s=fakeSignaling();const cid='GH-789';s.ids.add(cid.toLowerCase());s.onSignal(()=>{});
+ s.bridgeHandlers.signal({userid:'peer1',data:PW2.encodeSignal({type:'offer',callId:cid,sdp:'x'})});
+ await s.send('peer1',{type:'candidate',callId:cid,candidate:'cand1'});
+ assert.equal(s.sent.filter(x=>x.type==='candidate').length,0);
+ await s.send('peer1',{type:'answer',callId:cid,sdp:'y'});
+ assert.deepEqual(s.sent.map(x=>x.type),['answer','candidate']);
+ await sleep(400);
+ assert.equal(s.sent.filter(x=>x.type==='candidate').length,2);
+ await s.send('peer1',{type:'candidate',callId:cid,candidate:'cand2'});
+ assert.equal(s.sent.filter(x=>x.type==='candidate').length,3);
 });

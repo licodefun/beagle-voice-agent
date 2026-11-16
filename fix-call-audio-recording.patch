@@ -1,0 +1,180 @@
+# Fix: record live two-way calls as audio, not just transcript
+#
+# Evidence (call 2026-11-11 11:08 PST, record:
+#   workspace/beagle-voice-agent/records/call-2026-11-11-1108-wei.md):
+#   Wei asked (turn 6): "你把我們的對話…先record" — record our conversation.
+#   What he got was transcript + timings only. The record itself states:
+#   "no audio file is captured by the current stack — this transcript +
+#   timing record is what exists".
+#
+# Root cause, verified in code: the live two-way path (converse.js ->
+# lib/conversation.js ConversationSession) never taps the audio. The
+# recording building blocks already exist in the same repo but only on
+# the old one-way path: agent.js recordRemote() writes remote Opus RTP
+# via lib/ogg.js OggOpusWriter and converts to WAV with lib/audio.js
+# oggToWav (ffmpeg). converse.js creates ConversationSession for both
+# inbound and outbound calls and never passes any recording option.
+#
+# Fix (one file changed in the live path, plus wiring + a test):
+#   lib/conversation.js — ConversationSession gains optional
+#     {recordDir, callId}. When set, it:
+#     * writes the caller's raw Opus packets that pass the echo gate
+#       (the packets VAD/ASR actually consume, not speakerphone echo
+#       of Noor's own replies) to <recordDir>/call-<id>-wei.ogg, and
+#       converts it to -wei.wav on close (existing oggToWav/ffmpeg);
+#     * saves each of Noor's spoken replies (the Piper WAV the backend
+#       already returns) to call-<id>-noor-turn<N>.wav;
+#     * writes call-<id>.json: callId, peerId, started/endedAt,
+#       receivedPackets, and per-turn {turn, transcript, language,
+#       reply, file names}.
+#     Recording failures are caught, logged, and never break a call;
+#     with no recordDir nothing changes (existing tests construct the
+#     session without it). An empty recording (0 packets) deletes the
+#     .ogg and writes no manifest.
+#   converse.js — passes recordDir=<agent>/records and the real callId
+#     into both ConversationSession creations (inbound accept and
+#     outbound onOutboundId), so the next call lands in records/
+#     next to the transcript .md files.
+#   tests/conversation.test.js — feeds a real WAV->Opus->decoder->VAD
+#     pipeline through a recording session and asserts the .ogg, the
+#     converted .wav, the per-turn reply wav, and the manifest exist.
+#     Verified 2026-11-11 ~14:50 PST on a scratch copy: all 17 tests
+#     in tests/conversation.test.js pass, including the new one.
+#
+# Apply:  cd ~/workspace/beagle-voice-agent && patch -p1 < fix-call-audio-recording.patch
+#         (working tree is not a git repo, so no git apply)
+# Then:   restart the listener (same restart as the hearing-grounding
+#         patch — bundle both into one restart + one test call), make
+#         a short call, and check records/ for call-<id>-wei.wav,
+#         call-<id>-noor-turn1.wav and call-<id>.json.
+# NOT fixed by this patch: 9.6-11.4 s turn latency, the 3 empty
+#   transcripts, or the hearing-grounding defect (separate patch:
+#   fix-hearing-grounding.patch). The .ogg/.wav is Wei's side only
+#   post echo-gate plus Noor's replies as separate files — a mixed
+#   single-track recording is a later step, not this one.
+#
+--- a/lib/conversation.js
++++ b/lib/conversation.js
+@@ -1,4 +1,8 @@
+ import OpusScript from 'opusscript';
++import fs from 'node:fs';
++import path from 'node:path';
++import { OggOpusWriter } from './ogg.js';
++import { oggToWav } from './audio.js';
+ import {pcmWavToOpus} from './wav-opus.js';
+ import { spawn } from 'node:child_process';
+ import { readOggOpusPackets } from './ogg.js';
+@@ -17,8 +21,20 @@
+ // Deliberately half duplex: discard incoming audio while processing/speaking and
+ // for 800 ms after playback, so speakerphone echo cannot recursively trigger replies.
+ export class ConversationSession {
+-  constructor({src,backend,log=()=>{},encode=wavToPackets,now=()=>performance.now(),muteTailMs=800,peerId=null}) {
++  constructor({src,backend,log=()=>{},encode=wavToPackets,now=()=>performance.now(),muteTailMs=800,peerId=null,recordDir=null,callId=null}) {
+     Object.assign(this,{src,backend,log,encode,now,muteTailMs,peerId}); this.closed=false; this.busy=false; this.muteUntil=0; this.history=[]; this.subs=[]; this.tracks=new Set(); this.receivedPackets=0;
++    // Call audio recording (Wei's "record our conversation"): off unless
++    // the caller passes recordDir + callId. Failures here must never break a call.
++    this.recordDir=recordDir; this.callId=callId; this.recorder=null; this.recordBase=null;
++    this.recordManifest={callId,peerId,startedAt:new Date().toISOString(),turns:[]};
++    if(recordDir && callId){
++      try{
++        fs.mkdirSync(recordDir,{recursive:true});
++        const safe=String(callId).replace(/[^A-Za-z0-9_-]/g,'').slice(0,32)||'call';
++        this.recordBase=path.join(recordDir,`call-${safe}`);
++        this.recorder=new OggOpusWriter(this.recordBase+'-wei.ogg');
++      }catch(e){ this.log('call recording unavailable',e.message); this.recorder=null; }
++    }
+     this.decoder=new OpusScript(48000,2,OpusScript.Application.AUDIO); this.remainder=Buffer.alloc(0);
+     this.turnNumber=0;this.currentTurn=null;
+     this.vad=new TurnDetector((pcm,meta)=>this.submit(pcm,meta));
+@@ -36,6 +52,9 @@
+       // Decode even while muted: preserve Opus decoder state, but never feed echo to VAD.
+       const stereo=this.decoder.decode(payload); this.receivedPackets++; if(this.receivedPackets===1)this.log('FIRST_REMOTE_RTP_DECODED',stereo.length,'PCM bytes');
+       if(this.busy || this.now()<this.muteUntil) { this.vad.reset();this.remainder=Buffer.alloc(0); return; }
++      // Record only what VAD/ASR actually hears: post echo-gate, so the file
++      // is the caller's speech, not speakerphone echo of Noor's own replies.
++      if(this.recorder){ try{ this.recorder.write(payload); }catch(e){ this.log('call recording write failed',e.message); this.recorder=null; } }
+       const pcm=Buffer.alloc(Math.floor(stereo.length/24)*2);
+       for(let i=0,j=0;i+23<stereo.length;i+=24,j+=2) { let n=0;for(let k=0;k<24;k+=2)n+=stereo.readInt16LE(i+k);pcm.writeInt16LE(Math.round(n/12),j); }
+       this.remainder=Buffer.concat([this.remainder,pcm]);
+@@ -50,11 +69,33 @@
+       if(this.closed)return;
+       this.log('transcript',result.language,result.text,'reply',result.reply||'(no speech)',`${result.elapsedMs}ms`);
+       if(!result.text||!result.reply||!result.wav)return;
++      if(this.recordBase && !this.closed){
++        try{
++          const replyPath=`${this.recordBase}-noor-turn${meta.turn||this.turnNumber}.wav`;
++          fs.writeFileSync(replyPath,Buffer.from(result.wav,'base64'));
++          this.recordManifest.turns.push({turn:meta.turn||this.turnNumber,at:new Date().toISOString(),transcript:result.text,language:result.language||null,reply:result.reply,weiAudio:path.basename(this.recordBase+'-wei.ogg'),noorAudio:path.basename(replyPath)});
++        }catch(e){ this.log('call recording reply save failed',e.message); }
++      }
+       const backendAt=performance.now();const packets=await this.encode(Buffer.from(result.wav,'base64')); if(this.closed)return;
+       this.currentTurn={...meta,...result.stages,backendRoundtripMs:Math.round(backendAt-meta.endpointAt),encodeMs:Math.round(performance.now()-backendAt)};
+       this.history.push({role:'user',content:result.text},{role:'assistant',content:result.reply});this.history=this.history.slice(-8);
+       this.log('sending spoken reply',packets.length,'Opus frames'); await this.src.play(packets);
+     } finally {this.currentTurn=null;this.busy=false;this.muteUntil=this.now()+this.muteTailMs;this.vad.reset();this.remainder=Buffer.alloc(0);}
+   }
+-  close() {if(this.closed)return;this.closed=true;clearInterval(this.timer);this.queue.close();this.src.stop();for(const s of this.subs)s?.unSubscribe?.();this.decoder.delete();this.history=[];this.vad.reset();}
++  close() {if(this.closed)return;this.closed=true;clearInterval(this.timer);this.queue.close();this.src.stop();for(const s of this.subs)s?.unSubscribe?.();this.decoder.delete();this.history=[];this.vad.reset();
++    if(this.recorder){ const rec=this.recorder; this.recorder=null;
++      try{
++        rec.close();
++        if(rec.count>0){
++          let weiFile=this.recordBase+'-wei.ogg';
++          try{ oggToWav(weiFile,this.recordBase+'-wei.wav'); weiFile=this.recordBase+'-wei.wav'; }catch(e){ this.log('call recording wav convert failed',e.message); }
++          this.recordManifest.endedAt=new Date().toISOString();
++          this.recordManifest.weiAudio=path.basename(weiFile);
++          this.recordManifest.receivedPackets=this.receivedPackets;
++          fs.writeFileSync(this.recordBase+'.json',JSON.stringify(this.recordManifest,null,2));
++          this.log('call recording saved',this.recordBase+'.json');
++        } else { try{ fs.unlinkSync(this.recordBase+'-wei.ogg'); }catch{} }
++      }catch(e){ this.log('call recording finalize failed',e.message); }
++    }
++  }
+ }
+--- a/converse.js
++++ b/converse.js
+@@ -36,7 +36,7 @@
+    const current=await fetch(base+'/api/friends-list',{signal:AbortSignal.timeout(5000)}).then(r=>{if(!r.ok)throw new Error('friend permission unavailable');return r.json();});
+    if(!(current.friends||[]).some(f=>f.userid===info.peerId&&f.accepted===true))throw new Error('caller is not an accepted friend');
+    if(active!==key)return engine.reject(info.callId);
+-   session=new ConversationSession({src,backend,log,peerId:info.peerId});
++   session=new ConversationSession({src,backend,log,peerId:info.peerId,recordDir:path.join(path.dirname(new URL(import.meta.url).pathname),'records'),callId:info.callId});
+    log('answering accepted friend',info.peerId,info.callId);
+    await engine.accept(info.callId);
+   }catch(e){log('accept refused/failed',e.message);if(active===key){session?.close();session=null;active=null;budget.stop();status();}await engine.reject(info.callId).catch(()=>{});}
+@@ -53,7 +53,7 @@
+   signaling.onRemoteAnswered=id=>{if(id===active)log('REMOTE_ANSWERED_HARD_LIMIT_UNCHANGED',id);};
+   signaling.onOutboundId=id=>{
+    if(Date.now()-outgoingStarted>=180000)throw new Error('call setup exceeded hard limit');
+-   callId=id;active=id.toLowerCase();session=new ConversationSession({src,backend,log,peerId:peer});budget.start(id,180000-(Date.now()-outgoingStarted));status();
++   callId=id;active=id.toLowerCase();session=new ConversationSession({src,backend,log,peerId:peer,recordDir:path.join(path.dirname(new URL(import.meta.url).pathname),'records'),callId:id});budget.start(id,180000-(Date.now()-outgoingStarted));status();
+    log('OFFLINE_CALL_START',callId,'peer',peer,'route Socket.IO + SDK wake push; hard maximum 180 seconds including setup');
+   };
+   try {const actualId=await engine.call(peer,{audio:true,video:false});log('OFFLINE_INVITE_SUBMITTED',actualId,'NOT proof of remote ringing');}
+--- a/tests/conversation.test.js
++++ b/tests/conversation.test.js
+@@ -93,3 +93,24 @@
+  b.start('PENDING-OUTGOING');b.start('OUTGOING',170000);assert.equal(delay,170000);b.stop();tick();assert.deepEqual(expired,['incoming']);assert(cleared>0);
+  b.start('test',999999);assert.equal(delay,180000);b.stop();
+ });
++
++test('live conversation path records caller audio and reply audio to files',async()=>{
++ const {mkdtempSync,existsSync,readFileSync,readdirSync}=await import('node:fs');
++ const {tmpdir}=await import('node:os');
++ const {join}=await import('node:path');
++ const {execFileSync}=await import('node:child_process');
++ const dir=mkdtempSync(join(tmpdir(),'bva-record-'));
++ const wav=execFileSync('ffmpeg',['-v','error','-f','lavfi','-i','sine=frequency=440:duration=1','-ar','48000','-ac','1','-f','wav','pipe:1']);
++ const packets=await wavToPackets(wav);
++ const s=new ConversationSession({src:{play:async()=>{},stop:()=>{}},backend:{request:async()=>({text:'hello',language:'en',reply:'Hi Wei.',wav:Buffer.from('RIFFxxxx').toString('base64')})},encode:async()=>[Buffer.from([0xf8,0xff,0xfe])],now:()=>0,muteTailMs:0,recordDir:dir,callId:'TESTCALL123'});
++ for(const p of packets)s.receive(p);
++ s.vad.flush();await s.queue.idle;
++ s.close();
++ const files=readdirSync(dir);
++ assert(files.some(f=>f.endsWith('-wei.ogg')));
++ assert(files.some(f=>f.endsWith('-wei.wav')));
++ assert(files.some(f=>f.includes('-noor-turn1.wav')));
++ assert(existsSync(join(dir,'call-TESTCALL123.json')));
++ const manifest=JSON.parse(readFileSync(join(dir,'call-TESTCALL123.json'),'utf8'));
++ assert.equal(manifest.turns.length,1);assert.equal(manifest.turns[0].transcript,'hello');assert.equal(manifest.turns[0].reply,'Hi Wei.');
++});

@@ -9,7 +9,7 @@ const backend=new LocalBackend({log:(...a)=>fs.appendFileSync('out/quality-worke
 try{
  await backend.ready;
  for(const text of ['Who are you?','你是谁？']){
-  const r=await backend.request({op:'chat',text});assert.match(r.reply,/Rio/i);assert(!/Rio.?s (assistant|helper)|Rio的助手/.test(r.reply));report.push({test:'identity',text,reply:r.reply});
+  const r=await backend.request({op:'chat',text});assert.match(r.reply,/Noor/i);assert(!/Noor.?s (assistant|helper)|Noor的助手/.test(r.reply));report.push({test:'identity',text,reply:r.reply});
  }
  for(const [text,history,expected] of [['What is my favourite fruit?',[{role:'user',content:'My favourite fruit is mango.'},{role:'assistant',content:'Your favourite fruit is mango.'}],/mango/i],['我喜欢什么水果？',[{role:'user',content:'我喜欢苹果。'},{role:'assistant',content:'你喜欢苹果。'}],/苹果/]]){
   const r=await backend.request({op:'chat',text,history});assert.match(r.reply,expected);report.push({test:'context',reply:r.reply});

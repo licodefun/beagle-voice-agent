@@ -1,7 +1,6 @@
 node_modules/
 models/
 .venv/
-.venv312/
 __pycache__/
 *.pyc
 out/
@@ -9,21 +8,8 @@ runtime/
 *.log
 .env
 
-# Audio recordings and generated speech (existing tracked test fixtures remain)
-*.m4a
-*.wav
-*.ogg
-*.oga
-*.opus
-*.aac
-*.caf
-*.amr
-*.mp3
-*.flac
-
-# Identity / secrets (belt and braces; .env already ignored)
-*.pem
-*.key
-*.p12
-id_rsa
-id_ed25519
+# Noor production runtime artifacts — never check in
+records/
+.gpu-key
+backups/
+bench-google-stack/
