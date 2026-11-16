@@ -46,6 +46,68 @@ def _learn_peer_lang(peer, lang):
             _PEER_LANG_PATH.parent.mkdir(exist_ok=True)
             _PEER_LANG_PATH.write_text(json.dumps(_peer_lang))
         except Exception: pass
+# ---- 4090 GPU API (Wei's home RTX 4090; OpenAI-style; key in .gpu-key) ----
+# Primary per stage when its flag is on; the local CPU stack stays loaded
+# and is the fallback for ANY GPU failure (a 503 gpu_busy mid-call means
+# Wei's own job has the card — the local model answers, never a wait).
+# Warm bench 2026-11-16: ASR ~1.2 s vs ~3.0 s local; qwen2.5:7b chat
+# ~0.7 s per short reply vs ~3-5 s local; qwen3tts ~6 s per sentence vs
+# Piper ~1 s, so GPU TTS defaults OFF. qwen3:14b thinks in a separate
+# field and no think-off switch worked (think:false, chat_template_kwargs,
+# /no_think all still burned the budget reasoning) — never use it for
+# voice turns. The API's whisper has no hotwords; a prompt field carrying
+# the names is sent, passthrough unverified — local whisper keeps its
+# hotword advantage on names if the prompt is ignored.
+GPU_BASE = os.environ.get('BVA_GPU_BASE', 'https://4090.beagle.chat/v1')
+GPU_ASR = os.environ.get('BVA_GPU_ASR', '0') == '1'
+GPU_LLM = os.environ.get('BVA_GPU_LLM', '0') == '1'
+GPU_TTS = os.environ.get('BVA_GPU_TTS', '0') == '1'
+GPU_LLM_MODEL = os.environ.get('BVA_GPU_LLM_MODEL', 'qwen2.5:7b')
+_GPU_KEY = None
+def _gpu_key():
+    global _GPU_KEY
+    if _GPU_KEY is None:
+        try: _GPU_KEY = (ROOT / '.gpu-key').read_text().strip()
+        except Exception: _GPU_KEY = os.environ.get('BVA_GPU_KEY', '')
+    return _GPU_KEY
+_gpu_http = urllib.request.build_opener(urllib.request.ProxyHandler())
+def _gpu_post(path, data, ctype, timeout):
+    req = urllib.request.Request(GPU_BASE + path, method='POST', data=data)
+    req.add_header('Authorization', 'Bearer ' + _gpu_key()); req.add_header('Content-Type', ctype)
+    with _gpu_http.open(req, timeout=timeout) as resp: return resp.read()
+class _GpuSeg:
+    __slots__ = ('text', 'no_speech_prob', 'avg_logprob')
+    def __init__(self, text): self.text, self.no_speech_prob, self.avg_logprob = text, 0.0, 0.0
+class _GpuInfo:
+    def __init__(self, language):
+        self.language = language; self.language_probability = 1.0 if language else 0.0; self.all_language_probs = []
+def _gpu_transcribe(audio, language):
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.writeframes((np.clip(audio, -1, 1) * 32767).astype('<i2').tobytes())
+    b = '----bva' + str(int(time.time() * 1000))
+    fields = [('model', 'whisper'), ('response_format', 'verbose_json'), ('prompt', 'Noor, Wei Li, Beagle, Rio')]
+    if language: fields.append(('language', language))
+    raw = b''
+    for name, val in fields: raw += f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode()
+    raw += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="clip.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode() + buf.getvalue() + b'\r\n' + f'--{b}--\r\n'.encode()
+    d = json.loads(_gpu_post('/audio/transcriptions', raw, f'multipart/form-data; boundary={b}', 20))
+    text = (d.get('text') or '').strip()
+    lang = d.get('language') or language
+    segs = [_GpuSeg(sg.get('text', '')) for sg in (d.get('segments') or [])] or ([_GpuSeg(text)] if text else [])
+    return segs, _GpuInfo(lang)
+_ASR_BACKEND = {'last': 'local'}
+def transcribe_any(audio, **kw):
+    if GPU_ASR and _gpu_key():
+        try:
+            segs, info = _gpu_transcribe(audio, kw.get('language'))
+            _ASR_BACKEND['last'] = 'gpu'; return segs, info
+        except Exception as e:
+            print(f'[gpu] asr fallback: {e}', file=sys.stderr)
+    _ASR_BACKEND['last'] = 'local'
+    return asr.transcribe(audio, **kw)
+
 # Last spoken reply per call, for the anti-repeat guard (call 9f36a3a6:
 # the model returned one identical canned sentence five turns in a row).
 _last_reply = {}
@@ -101,6 +163,37 @@ try:
     voices = {}
     for lang, rel in [('en','en/en_US/lessac/low/en_US-lessac-low.onnx'),('zh','zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx')]:
         voices[lang] = PiperVoice.load(MODELS/'piper'/rel)
+    _LLM_BACKEND = {'last': 'local'}
+    def chat_any(messages, sentence_limit=1):
+        if GPU_LLM and _gpu_key():
+            try:
+                body = json.dumps({'model': GPU_LLM_MODEL, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}).encode()
+                d = json.loads(_gpu_post('/chat/completions', body, 'application/json', 25))
+                content = (d['choices'][0]['message'].get('content') or '').strip()
+                if content:
+                    _LLM_BACKEND['last'] = 'gpu'
+                    return content[:550 if sentence_limit > 1 else 300]
+            except Exception as e:
+                print(f'[gpu] chat fallback: {e}', file=sys.stderr)
+        _LLM_BACKEND['last'] = 'local'
+        return chat(messages, sentence_limit)
+    _TTS_BACKEND = {'last': 'local'}
+    def synthesize(reply, lang):
+        # Normalized wav bytes: GPU qwen3tts when enabled (bench says
+        # slower than Piper today — flag off by default), else Piper.
+        # Any GPU failure falls back to Piper.
+        if GPU_TTS and _gpu_key():
+            try:
+                body = json.dumps({'model': 'qwen3tts', 'voice': 'neutral-zh' if lang == 'zh' else 'neutral-en', 'input': reply, 'response_format': 'wav'}).encode()
+                raw = _gpu_post('/audio/speech', body, 'application/json', 20)
+                if raw[:4] == b'RIFF':
+                    _TTS_BACKEND['last'] = 'gpu'; return normalize_wav_bytes(raw)
+            except Exception as e:
+                print(f'[gpu] tts fallback: {e}', file=sys.stderr)
+        _TTS_BACKEND['last'] = 'local'
+        output = io.BytesIO()
+        with wave.open(output, 'wb') as wav: voices[lang].synthesize_wav(reply, wav)
+        return normalize_wav_bytes(output.getvalue())
     # Readiness is emitted after profile-specific warmup below.
 except Exception as e:
     emit({'ready':False,'error':str(e)}); sys.exit(1)
@@ -177,13 +270,13 @@ def handle_request(req):
                 if last == 'zh': forced = 'zh'
                 elif last == 'en' and 'zh' not in seen: forced = 'en'
             decode_language = language or locked or forced
-            segments, info = asr.transcribe(audio, language=decode_language, **options)
+            segments, info = transcribe_any(audio, language=decode_language, **options)
             if FAST and not decode_language and info.language not in ('en','zh'):
                 # Short Chinese/English turns sometimes score Japanese first. Decode
                 # once in the strongest supported language, or ignore very weak noise.
                 allowed = bilingual_choice(info.language,info.all_language_probs)
                 if allowed is None: segments = []
-                else: segments, info = asr.transcribe(audio,language=allowed,**options)
+                else: segments, info = transcribe_any(audio,language=allowed,**options)
             segments = [s for s in segments if s.no_speech_prob < .8 and s.avg_logprob > -1.2]
             text = ''.join(s.text for s in segments).strip()
             if call_id:
@@ -194,7 +287,7 @@ def handle_request(req):
                     # what confidence scores cannot. Fall back to
                     # auto-detect once; the lock/prior update below
                     # re-learns from the retry's detection.
-                    retry_segments, retry_info = asr.transcribe(audio, language=None, **options)
+                    retry_segments, retry_info = transcribe_any(audio, language=None, **options)
                     retry_segments = [s for s in retry_segments if s.no_speech_prob < .8 and s.avg_logprob > -1.2]
                     retry_text = ''.join(s.text for s in retry_segments).strip()
                     if retry_text:
@@ -206,7 +299,7 @@ def handle_request(req):
                     # The locked language heard nothing (caller may have
                     # switched language): retry once unlocked, re-lock if
                     # the retry detects a supported language confidently.
-                    retry_segments, retry_info = asr.transcribe(audio, language=None, **options)
+                    retry_segments, retry_info = transcribe_any(audio, language=None, **options)
                     retry_segments = [s for s in retry_segments if s.no_speech_prob < .8 and s.avg_logprob > -1.2]
                     retry_text = ''.join(s.text for s in retry_segments).strip()
                     if retry_text:
@@ -217,7 +310,7 @@ def handle_request(req):
             language = info.language
             if FAST and language not in ('en','zh'): language = None
         asr_done = time.monotonic()
-        result = {'id':req['id'],'text':text,'language':language,'profile':'fast' if FAST else 'baseline','stages':{'asrMs':round((asr_done-started)*1000,2)}}
+        result = {'id':req['id'],'text':text,'language':language,'profile':'fast' if FAST else 'baseline','stages':{'asrMs':round((asr_done-started)*1000,2),'asrBackend':_ASR_BACKEND['last'] if op in ('asr','turn') else 'n/a'}}
         if op != 'asr' and text:
             if op == 'tts': reply = text
             else:
@@ -255,7 +348,7 @@ def handle_request(req):
                 elif not beagle_topic(text,history) and not owner_allowed(trusted_peer):
                     reply=scope_redirect(text);result['replySource']='scope-redirect'
                 else:
-                    reply=finalize(chat(messages,sentence_limit=2 if story else 1));result['replySource']='local-model-grounded' if owner_allowed(trusted_peer) else 'local-model-public'
+                    reply=finalize(chat_any(messages,sentence_limit=2 if story else 1));result['replySource']='local-model-grounded' if owner_allowed(trusted_peer) else 'local-model-public'
                     call_id = req.get('callId')
                     recent = _last_reply.get(call_id) or []
                     if FAST and call_id and is_repeat_of_recent(recent, reply):
@@ -266,7 +359,7 @@ def handle_request(req):
                         # still repeats, break the loop with a brief
                         # acknowledgment instead of a third parroting.
                         nudged = [dict(messages[0], content=messages[0]['content'] + '\nIMPORTANT: your previous reply repeated your earlier answer word for word. Answer the caller\'s newest words directly, in a different way; never repeat that sentence.')] + messages[1:]
-                        retry = finalize(chat(nudged, sentence_limit=2 if story else 1))
+                        retry = finalize(chat_any(nudged, sentence_limit=2 if story else 1))
                         if is_repeat_of_recent(recent, retry):
                             reply = repeat_fallback(text); result['repeatGuard'] = 'fallback'
                         else:
@@ -276,14 +369,12 @@ def handle_request(req):
                     _recent = _last_reply.setdefault(req['callId'], [])
                     _recent.append(reply); del _recent[:-3]
             llm_done = time.monotonic()
-            result['stages']['llmMs'] = round((llm_done-asr_done)*1000,2)
+            result['stages']['llmMs'] = round((llm_done-asr_done)*1000,2); result['stages']['llmBackend'] = _LLM_BACKEND['last']
             result['reply'] = reply
             if op != 'chat':
                 lang = 'zh' if any('\u4e00'<=c<='\u9fff' for c in reply) else 'en'
-                output = io.BytesIO()
-                with wave.open(output,'wb') as wav: voices[lang].synthesize_wav(reply,wav)
-                result['wav'] = base64.b64encode(normalize_wav_bytes(output.getvalue())).decode()
-                result['stages']['ttsMs'] = round((time.monotonic()-llm_done)*1000,2)
+                result['wav'] = base64.b64encode(synthesize(reply, lang)).decode()
+                result['stages']['ttsMs'] = round((time.monotonic()-llm_done)*1000,2); result['stages']['ttsBackend'] = _TTS_BACKEND['last']
         elif op == 'turn':
             # ASR (including the unlocked retry) heard nothing intelligible:
             # never answer a turn with silence (call ba87ef9d turn 1 burned
@@ -295,10 +386,8 @@ def handle_request(req):
             result['stages']['llmMs'] = 0
             result['reply'] = reply
             lang = 'zh' if any('\u4e00'<=c<='\u9fff' for c in reply) else 'en'
-            output = io.BytesIO()
-            with wave.open(output,'wb') as wav: voices[lang].synthesize_wav(reply,wav)
-            result['wav'] = base64.b64encode(normalize_wav_bytes(output.getvalue())).decode()
-            result['stages']['ttsMs'] = round((time.monotonic()-asr_done)*1000,2)
+            result['wav'] = base64.b64encode(synthesize(reply, lang)).decode()
+            result['stages']['ttsMs'] = round((time.monotonic()-asr_done)*1000,2); result['stages']['ttsBackend'] = _TTS_BACKEND['last']
         result['elapsedMs'] = round((time.monotonic()-started)*1000); return result
     except Exception as e:
         return {'id':req.get('id'),'error':str(e)}
