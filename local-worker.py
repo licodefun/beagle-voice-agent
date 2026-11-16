@@ -52,11 +52,14 @@ def _learn_peer_lang(peer, lang):
 # Wei's own job has the card — the local model answers, never a wait).
 # Warm bench 2026-11-16: ASR ~1.2 s vs ~3.0 s local; qwen2.5:7b chat
 # ~0.7 s per short reply vs ~3-5 s local; qwen3tts ~6 s per sentence vs
-# Piper ~1 s, so GPU TTS defaults OFF. qwen3:14b thinks in a separate
-# field and no think-off switch worked (think:false, chat_template_kwargs,
-# /no_think all still burned the budget reasoning) — never use it for
-# voice turns. The API's whisper has no hotwords; a prompt field carrying
-# the names is sent, passthrough unverified — local whisper keeps its
+# Piper ~1 s, so GPU TTS defaults OFF. qwen3 thinking is disabled with
+# top-level reasoning_effort:"none" (HQ-verified 2026-11-16; think:false
+# does NOT work on this route) — qwen3:14b is the live reply model.
+# Second tier: Wei's Mac mini (mini.beagle.chat) with qwen3:8b + whisper
+# large-v3, used per stage when the 4090 fails (503 gpu_busy / down),
+# before the local CPU stack. Active only when .gpu-key-mini exists.
+# The remote whispers have no hotwords; a prompt field carrying the
+# names is sent, passthrough unverified — local whisper keeps its
 # hotword advantage on names if the prompt is ignored.
 GPU_BASE = os.environ.get('BVA_GPU_BASE', 'https://4090.beagle.chat/v1')
 GPU_ASR = os.environ.get('BVA_GPU_ASR', '0') == '1'
@@ -70,18 +73,32 @@ def _gpu_key():
         try: _GPU_KEY = (ROOT / '.gpu-key').read_text().strip()
         except Exception: _GPU_KEY = os.environ.get('BVA_GPU_KEY', '')
     return _GPU_KEY
+MINI_BASE = os.environ.get('BVA_MINI_BASE', 'https://mini.beagle.chat/v1')
+MINI_LLM_MODEL = os.environ.get('BVA_MINI_LLM_MODEL', 'qwen3:8b')
+MINI_ON = os.environ.get('BVA_MINI', '1') == '1'
+_MINI_KEY = None
+def _mini_key():
+    global _MINI_KEY
+    if _MINI_KEY is None:
+        try: _MINI_KEY = (ROOT / '.gpu-key-mini').read_text().strip()
+        except Exception: _MINI_KEY = os.environ.get('BVA_MINI_KEY', '')
+    return _MINI_KEY
 _gpu_http = urllib.request.build_opener(urllib.request.ProxyHandler())
-def _gpu_post(path, data, ctype, timeout):
-    req = urllib.request.Request(GPU_BASE + path, method='POST', data=data)
-    req.add_header('Authorization', 'Bearer ' + _gpu_key()); req.add_header('Content-Type', ctype)
+def _remote_post(base, key, path, data, ctype, timeout):
+    req = urllib.request.Request(base + path, method='POST', data=data)
+    req.add_header('Authorization', 'Bearer ' + key); req.add_header('Content-Type', ctype)
     with _gpu_http.open(req, timeout=timeout) as resp: return resp.read()
+def _gpu_post(path, data, ctype, timeout):
+    return _remote_post(GPU_BASE, _gpu_key(), path, data, ctype, timeout)
+def _mini_post(path, data, ctype, timeout):
+    return _remote_post(MINI_BASE, _mini_key(), path, data, ctype, timeout)
 class _GpuSeg:
     __slots__ = ('text', 'no_speech_prob', 'avg_logprob')
     def __init__(self, text): self.text, self.no_speech_prob, self.avg_logprob = text, 0.0, 0.0
 class _GpuInfo:
     def __init__(self, language):
         self.language = language; self.language_probability = 1.0 if language else 0.0; self.all_language_probs = []
-def _gpu_transcribe(audio, language):
+def _gpu_transcribe(audio, language, post=_gpu_post):
     buf = io.BytesIO()
     with wave.open(buf, 'wb') as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
@@ -92,7 +109,7 @@ def _gpu_transcribe(audio, language):
     raw = b''
     for name, val in fields: raw += f'--{b}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{val}\r\n'.encode()
     raw += f'--{b}\r\nContent-Disposition: form-data; name="file"; filename="clip.wav"\r\nContent-Type: audio/wav\r\n\r\n'.encode() + buf.getvalue() + b'\r\n' + f'--{b}--\r\n'.encode()
-    d = json.loads(_gpu_post('/audio/transcriptions', raw, f'multipart/form-data; boundary={b}', 20))
+    d = json.loads(post('/audio/transcriptions', raw, f'multipart/form-data; boundary={b}', 30))
     text = (d.get('text') or '').strip()
     lang = d.get('language') or language
     segs = [_GpuSeg(sg.get('text', '')) for sg in (d.get('segments') or [])] or ([_GpuSeg(text)] if text else [])
@@ -105,6 +122,12 @@ def transcribe_any(audio, **kw):
             _ASR_BACKEND['last'] = 'gpu'; return segs, info
         except Exception as e:
             print(f'[gpu] asr fallback: {e}', file=sys.stderr)
+    if MINI_ON and _mini_key():
+        try:
+            segs, info = _gpu_transcribe(audio, kw.get('language'), post=_mini_post)
+            _ASR_BACKEND['last'] = 'mini'; return segs, info
+        except Exception as e:
+            print(f'[mini] asr fallback: {e}', file=sys.stderr)
     _ASR_BACKEND['last'] = 'local'
     return asr.transcribe(audio, **kw)
 
@@ -164,24 +187,34 @@ try:
     for lang, rel in [('en','en/en_US/lessac/low/en_US-lessac-low.onnx'),('zh','zh/zh_CN/huayan/medium/zh_CN-huayan-medium.onnx')]:
         voices[lang] = PiperVoice.load(MODELS/'piper'/rel)
     _LLM_BACKEND = {'last': 'local'}
+    def _remote_chat(post, model, messages):
+        payload = {'model': model, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}
+        if 'qwen3' in model:
+            # Thinking MUST be off for voice turns: qwen3's reasoning
+            # otherwise eats the whole token budget and the caller hears
+            # nothing. HQ verified this switch 2026-11-16 (think:false
+            # does NOT work on this route).
+            payload['reasoning_effort'] = 'none'
+        d = json.loads(post('/chat/completions', json.dumps(payload).encode(), 'application/json', 30))
+        return (d['choices'][0]['message'].get('content') or '').strip()
     def chat_any(messages, sentence_limit=1):
+        cap = 550 if sentence_limit > 1 else 300
         if GPU_LLM and _gpu_key():
             try:
-                payload = {'model': GPU_LLM_MODEL, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}
-                if 'qwen3' in GPU_LLM_MODEL:
-                    # Thinking MUST be off for voice turns: qwen3's reasoning
-                    # otherwise eats the whole token budget and the caller
-                    # hears nothing. HQ verified this switch 2026-11-16
-                    # (think:false does NOT work on this route).
-                    payload['reasoning_effort'] = 'none'
-                body = json.dumps(payload).encode()
-                d = json.loads(_gpu_post('/chat/completions', body, 'application/json', 25))
-                content = (d['choices'][0]['message'].get('content') or '').strip()
+                content = _remote_chat(_gpu_post, GPU_LLM_MODEL, messages)
                 if content:
                     _LLM_BACKEND['last'] = 'gpu'
-                    return content[:550 if sentence_limit > 1 else 300]
+                    return content[:cap]
             except Exception as e:
                 print(f'[gpu] chat fallback: {e}', file=sys.stderr)
+        if MINI_ON and _mini_key():
+            try:
+                content = _remote_chat(_mini_post, MINI_LLM_MODEL, messages)
+                if content:
+                    _LLM_BACKEND['last'] = 'mini'
+                    return content[:cap]
+            except Exception as e:
+                print(f'[mini] chat fallback: {e}', file=sys.stderr)
         _LLM_BACKEND['last'] = 'local'
         return chat(messages, sentence_limit)
     _TTS_BACKEND = {'last': 'local'}
