@@ -167,7 +167,14 @@ try:
     def chat_any(messages, sentence_limit=1):
         if GPU_LLM and _gpu_key():
             try:
-                body = json.dumps({'model': GPU_LLM_MODEL, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}).encode()
+                payload = {'model': GPU_LLM_MODEL, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}
+                if 'qwen3' in GPU_LLM_MODEL:
+                    # Thinking MUST be off for voice turns: qwen3's reasoning
+                    # otherwise eats the whole token budget and the caller
+                    # hears nothing. HQ verified this switch 2026-11-16
+                    # (think:false does NOT work on this route).
+                    payload['reasoning_effort'] = 'none'
+                body = json.dumps(payload).encode()
                 d = json.loads(_gpu_post('/chat/completions', body, 'application/json', 25))
                 content = (d['choices'][0]['message'].get('content') or '').strip()
                 if content:
