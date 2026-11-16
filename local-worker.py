@@ -12,7 +12,7 @@ import subprocess, socket, urllib.request, signal, atexit
 from piper import PiperVoice
 from local_policy import bilingual_choice, completed_sentence, spoken_sentences, is_repeat_of_recent, repeat_fallback
 from speech_levels import normalize_wav_bytes, cap_spoken
-from grounding import owner_allowed, current_clock, clock_intent, clock_reply, contextual_system, call_system, fix_self_name, story_intent, endcall_intent, closing_reply, latency_excuse_repair, hearing_claim_repair, identity_intent, identity_reply
+from grounding import owner_allowed, current_clock, clock_intent, clock_reply, contextual_system, call_system, fix_self_name, story_intent, endcall_intent, closing_reply, latency_excuse_repair, hearing_claim_repair, identity_intent, identity_reply, stack_intent, stack_reply
 from beagle_faq import beagle_topic, scope_redirect, pricing_question, unknown_pricing
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
@@ -339,6 +339,12 @@ def handle_request(req):
                     # is a fixed line, so skip the model entirely
                     # (FD21CD4F: the LLM took 3.6-5.7 s to produce it).
                     reply=identity_reply(text);result['replySource']='identity-deterministic'
+                elif req.get('callId') and stack_intent(text):
+                    # Asked about the model/GPU switch itself: the model
+                    # cannot know it was rewired (call 4B927E01 answered
+                    # 'no update notice received' / 'nothing updated' to
+                    # exactly this, minutes after the GPU went live).
+                    reply=stack_reply(text);result['replySource']='stack-deterministic'
                 elif req.get('callId') and endcall_intent(text):
                     # Caller asked to end the call: deterministic closing
                     # with the right object (the call, not "Beagle" — the

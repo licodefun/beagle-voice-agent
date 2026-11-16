@@ -77,6 +77,16 @@ def call_system(peer_id):
         clock=current_clock();return context+'\nLocal routing verified this caller as owner. Fresh owner-only clock: '+clock['iso']+' '+clock['label']+' America/Los_Angeles.'
     return context+'\nThis caller is a general accepted friend, not the verified owner. No owner-only context is supplied.'
 
+_STACK_ZH = re.compile(r'(模型|显卡|gpu).{0,6}(换|更新|升级|改)|(换|更新|升级).{0,4}(成功|模型)|你.{0,4}更新了什么|更新了什么')
+_STACK_EN = re.compile(r'\b(switch|switched|change|changed|update|updated|upgrade|upgraded)\b[^.?!]{0,24}\b(model|gpu|4090)\b|\b(model|gpu)\b[^.?!]{0,24}\b(switch|change|update|upgrade)|\b4090\b|\b(what|anything|something) did you (update|change|switch)\b|\bdid you (update|change|switch)\b', re.I)
+def stack_intent(text):
+    t = text or ''
+    return bool(_STACK_ZH.search(t) or _STACK_EN.search(t))
+def stack_reply(text):
+    if re.search(r'[\u4e00-\u9fff]', text or ''):
+        return '换成功了。我的语音识别和回复现在跑在你家里的 4090 显卡上，本地 CPU 模型做备份，所以回答比以前快。'
+    return "Yes — the switch worked. My speech recognition and replies now run on your home RTX 4090, with the local CPU models as backup, so I'm faster than before."
+
 def story_intent(text):
     return bool(re.search(r'\bstory\b|how.*(develop|build|built)|故事|开发.*(经过|经历|过程)|怎么.*(开发|做)|开发.*语音',text,re.I))
 
