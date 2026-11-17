@@ -8,7 +8,7 @@ os.environ.setdefault('OMP_NUM_THREADS', str(THREADS))
 os.environ.setdefault('HF_HUB_OFFLINE', '1')
 import numpy as np
 from faster_whisper import WhisperModel
-import subprocess, socket, urllib.request, signal, atexit
+import subprocess, socket, urllib.request, urllib.error, http.client, signal, atexit
 from piper import PiperVoice
 from local_policy import bilingual_choice, completed_sentence, spoken_sentences, is_repeat_of_recent, repeat_fallback
 from speech_levels import normalize_wav_bytes, cap_spoken
@@ -91,10 +91,27 @@ def _mini_key():
         except Exception: _MINI_KEY = os.environ.get('BVA_MINI_KEY', '')
     return _MINI_KEY
 _gpu_http = urllib.request.build_opener(urllib.request.ProxyHandler())
+_CONN_ERRORS = (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)
 def _remote_post(base, key, path, data, ctype, timeout):
-    req = urllib.request.Request(base + path, method='POST', data=data)
-    req.add_header('Authorization', 'Bearer ' + key); req.add_header('Content-Type', ctype)
-    with _gpu_http.open(req, timeout=timeout) as resp: return resp.read()
+    # Retry ONCE on a connection-level failure (no HTTP status received):
+    # the gateways in front of the GPU hosts recycle kept-alive
+    # connections, and reusing a dead one surfaces as RemoteDisconnected
+    # ('Remote end closed connection without response') — a fresh attempt
+    # succeeds. HTTP errors (e.g. 503 gpu_busy) are NOT retried: they
+    # fall through to the caller's fallback immediately. Transcription
+    # and chat requests are safe to repeat. (HQ, 2026-11-17.)
+    for attempt in (1, 2):
+        req = urllib.request.Request(base + path, method='POST', data=data)
+        req.add_header('Authorization', 'Bearer ' + key); req.add_header('Content-Type', ctype)
+        try:
+            with _gpu_http.open(req, timeout=timeout) as resp: return resp.read()
+        except urllib.error.HTTPError:
+            raise
+        except _CONN_ERRORS:
+            if attempt == 2: raise
+        except urllib.error.URLError as e:
+            if attempt == 2 or not isinstance(e.reason, _CONN_ERRORS): raise
+    raise RuntimeError('unreachable')
 def _gpu_post(path, data, ctype, timeout):
     return _remote_post(GPU_BASE, _gpu_key(), path, data, ctype, timeout)
 def _mini_post(path, data, ctype, timeout):
