@@ -67,6 +67,13 @@ GPU_LLM = os.environ.get('BVA_GPU_LLM', '0') == '1'
 GPU_TTS = os.environ.get('BVA_GPU_TTS', '0') == '1'
 GPU_LLM_MODEL = os.environ.get('BVA_GPU_LLM_MODEL', 'qwen2.5:7b')
 _GPU_KEY = None
+def _tts_text(text, lang):
+    # Wei (2026-11-16): in Chinese, read 4090 digit by digit —
+    # 四零九零 — not as the number four thousand ninety.
+    if lang == 'zh' and text:
+        return text.replace('4090', '四零九零')
+    return text
+
 def _gpu_key():
     global _GPU_KEY
     if _GPU_KEY is None:
@@ -219,6 +226,7 @@ try:
         return chat(messages, sentence_limit)
     _TTS_BACKEND = {'last': 'local'}
     def synthesize(reply, lang):
+        reply = _tts_text(reply, lang)
         # Normalized wav bytes: GPU qwen3tts when enabled (bench says
         # slower than Piper today — flag off by default), else Piper.
         # Any GPU failure falls back to Piper.
