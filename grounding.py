@@ -5,6 +5,7 @@ import re
 OWNER_IDS = {
     '7yZfjNbbUwtQuHQzkAH87ditQUzULhjfPz1LYdRnsqwh',  # Wei's main client
     '8c4NS9AW9u4Pu158dd445hFWZ3on4S1DtWGsQ8TEFoEd',  # Wei's second client (HiRKNY address)
+    'AH7Fv8TnxJfATkhFUUoWcH29JwWRihqWNGaW1ennGE59',  # Wei's MacBook dev client (mac-dev), added 2026-11-18
 }
 OWNER_ID = '7yZfjNbbUwtQuHQzkAH87ditQUzULhjfPz1LYdRnsqwh'
 ZONE = ZoneInfo('America/Los_Angeles')
