@@ -11,6 +11,13 @@
 // Scope: the owner's own clients only — main (liwei.beagles.eth) plus,
 // since 2026-11-18 at Wei's direction, his MacBook dev client (mac-dev).
 // Other friends' texts are left to the chats.
+//
+// Key delivery (2026-11-19): a message from the owner carrying a
+// Google API-key-shaped token is intercepted before the chat model —
+// the key is written to .gemini-key (0600) for the worker's Gemini
+// tier and answered with a fixed ack. The chat model otherwise refuses
+// such messages ("I cannot receive API keys") and the key would be
+// forwarded to whichever LLM backend is primary.
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
@@ -25,7 +32,11 @@ const DAEMON = process.env.BEAGLE_URL || 'http://localhost:8766';
 const WATCHED = [
   '7yZfjNbbUwtQuHQzkAH87ditQUzULhjfPz1LYdRnsqwh', // Wei, liwei.beagles.eth (main)
   'AH7Fv8TnxJfATkhFUUoWcH29JwWRihqWNGaW1ennGE59', // Wei, mac-dev (MacBook client)
+  '8c4NS9AW9u4Pu158dd445hFWZ3on4S1DtWGsQ8TEFoEd', // Wei, nms/ipad.beagles.eth (second client, added 2026-11-22)
 ];
+const KEY_PATH = path.join(ROOT, '.gemini-key');
+const API_KEY_RE = /(?:AIza[0-9A-Za-z_-]{35}|AQ\.[0-9A-Za-z_-]{20,})/;
+const API_KEY_RE_G = /(?:AIza[0-9A-Za-z_-]{35}|AQ\.[0-9A-Za-z_-]{20,})/g;
 const POLL_MS = 4000;
 const MAX_AGE_MS = 10 * 60 * 1000; // never answer a stale text late
 const DIAL_COOLDOWN_MS = 90 * 1000;
@@ -73,6 +84,19 @@ async function handle(peer, msg, thread) {
   if (!text) return true;
   if (Date.now() - msg.ts > MAX_AGE_MS) { log('expired, skipping', peer.slice(0, 8), msg.ts); return true; }
   const zh = isZh(text);
+  const keyMatch = text.match(API_KEY_RE);
+  if (keyMatch) {
+    try {
+      fs.writeFileSync(KEY_PATH, keyMatch[0] + '\n', { mode: 0o600 });
+      fs.chmodSync(KEY_PATH, 0o600);
+      await sendText(peer, zh ? '收到，密钥已保存。' : 'Got it — key saved.');
+      log('api key saved to .gemini-key from', peer.slice(0, 8));
+    } catch (e) {
+      log('api key save failed:', e.message);
+      await sendText(peer, zh ? '保存密钥时出错了，请稍后再试。' : 'Saving the key failed — please try again.');
+    }
+    return true;
+  }
   if (callIntent(text)) {
     if (callActive()) {
       await sendText(peer, zh ? '我们已经在通话中了，我在听。' : "We're already on a call — I'm here.");
@@ -90,7 +114,7 @@ async function handle(peer, msg, thread) {
   const history = thread
     .filter((m) => m.ts < msg.ts && clean(m.text))
     .slice(-8)
-    .map((m) => ({ role: m.dir === 'in' ? 'user' : 'assistant', content: clean(m.text) }));
+    .map((m) => ({ role: m.dir === 'in' ? 'user' : 'assistant', content: clean(m.text).replace(API_KEY_RE_G, '[api key]') }));
   const res = await workerChat(peer, text, history);
   if (res.error) throw new Error('worker: ' + res.error);
   if (res.reply) { await sendText(peer, res.reply); log('replied on', peer.slice(0, 8), JSON.stringify(text.slice(0, 40)), '->', JSON.stringify(res.reply.slice(0, 60)), res.replySource || ''); }
