@@ -86,8 +86,8 @@ def stack_intent(text):
     return bool(_STACK_ZH.search(t) or _STACK_EN.search(t) or _STACK_EN2.search(t))
 def stack_reply(text):
     if re.search(r'[\u4e00-\u9fff]', text or ''):
-        return '换成功了。我的语音识别和回复现在跑在你家里的 4090 显卡上，本地 CPU 模型做备份，所以回答比以前快。'
-    return "Yes — the switch worked. My speech recognition and replies now run on your home RTX 4090, with the local CPU models as backup, so I'm faster than before."
+        return '换成功了。通话里我的回复和语音识别都跑在你家里的 4090 显卡上，本地 CPU 模型做备份；文字消息的回复走 Google 的 Gemini 4 Hydrogen。'
+    return "Yes — the switch worked. On calls, my replies and speech recognition run on your home RTX 4090 with the local CPU models as backup; my text replies run on Google's Gemini 4 Hydrogen."
 
 def story_intent(text):
     return bool(re.search(r'\bstory\b|how.*(develop|build|built)|故事|开发.*(经过|经历|过程)|怎么.*(开发|做)|开发.*语音',text,re.I))
@@ -147,6 +147,30 @@ def hearing_claim_repair(reply, text):
     if _HEAR_CHECK_EN.search(text or ''): return "I can hear you, but I couldn't make that out — could you repeat it, briefly?"
     if zh or re.search(r'[\u4e00-\u9fff]', reply): return '我在，我可能听错了，请您简短再说一遍。'
     return "I'm here — I may have misheard that; could you say it once more, briefly?"
+
+# Text-chat repair (Beagle thread, 2026-11-22): the chat op carries
+# TYPED text — no audio, no transcript — so a mishearing reply is never
+# true there. Yet with the Gemini tier timed out, the grounded model
+# answered Wei's typed "Why you send duplicated messages?" with "I may
+# have misheard you — could you please repeat your question in one
+# short sentence?" (twice): the ambassador prompt's hearing and
+# contradiction rules are written for transcribed speech, and the
+# thread history was primed with earlier copies of the same line.
+# Voice turns keep the misheard line (legitimate there); a text chat
+# whose reply claims a hearing failure gets a plain snag line instead.
+_MISHEARD_REPLY_EN = re.compile(r"\bmishear\w*\b|\bdidn'?t catch (?:that|it)\b|\bsay (?:it|that) once more\b|\brepeat your (?:question|message)\b", re.I)
+_MISHEARD_REPLY_ZH = re.compile(r'(听错|没听清|听不清|请.{0,4}(再说|重复)一遍)')
+def misheard_reply(reply):
+    if not reply: return False
+    return bool(_MISHEARD_REPLY_EN.search(reply) or _MISHEARD_REPLY_ZH.search(reply))
+def text_snag_reply(text):
+    if re.search(r'[\u4e00-\u9fff]', text or ''):
+        return '抱歉，我刚才回答时出了点问题，请再发一次。'
+    return 'Sorry — I hit a snag answering that just now; please send it once more.'
+def text_reply_repair(reply, text):
+    """Chat-op only: swap a mishearing reply for the text snag line."""
+    if misheard_reply(reply): return text_snag_reply(text)
+    return reply
 
 # Deterministic identity answer (latency round 5, 2026-11-13): "who are
 # you" is the single most common call question, and its grounded answer

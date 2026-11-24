@@ -12,7 +12,7 @@ import subprocess, socket, urllib.request, urllib.error, http.client, signal, at
 from piper import PiperVoice
 from local_policy import bilingual_choice, completed_sentence, spoken_sentences, is_repeat_of_recent, repeat_fallback
 from speech_levels import normalize_wav_bytes, cap_spoken
-from grounding import owner_allowed, current_clock, clock_intent, clock_reply, contextual_system, call_system, fix_self_name, story_intent, endcall_intent, closing_reply, latency_excuse_repair, hearing_claim_repair, identity_intent, identity_reply, stack_intent, stack_reply
+from grounding import owner_allowed, current_clock, clock_intent, clock_reply, contextual_system, call_system, fix_self_name, story_intent, endcall_intent, closing_reply, latency_excuse_repair, hearing_claim_repair, text_reply_repair, identity_intent, identity_reply, stack_intent, stack_reply
 from beagle_faq import beagle_topic, scope_redirect, pricing_question, unknown_pricing
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / 'models'
@@ -90,6 +90,27 @@ def _mini_key():
         try: _MINI_KEY = (ROOT / '.gpu-key-mini').read_text().strip()
         except Exception: _MINI_KEY = os.environ.get('BVA_MINI_KEY', '')
     return _MINI_KEY
+# Third remote tier (Wei, 2026-11-19): Google Gemini 4 Hydrogen on the
+# free tier of the Gemini API, through Google's OpenAI-compatible
+# endpoint (Bearer key — the same _remote_post helper the GPU hosts
+# use). FIRST for TEXT chat ops only: measured 10-16 s per reply, fine
+# for texts but far too slow mid-call, so voice turns skip this tier
+# entirely and keep the 4090 primary (Wei's split decision, 2026-11-19).
+# Hydrogen generates no audio and has no Live API, so ASR/TTS never
+# route here either.
+# The free tier is rate-limited; a 429 is an HTTP error, so chat_any
+# falls through to the 4090 exactly like a gpu_busy 503. Key lives in
+# .gemini-key (chmod 600), same pattern as .gpu-key — never in code.
+GEMINI_BASE = os.environ.get('BVA_GEMINI_BASE', 'https://generativelanguage.googleapis.com/v1beta/openai')
+GEMINI_MODEL = os.environ.get('BVA_GEMINI_MODEL', 'gemini-4-hydrogen')
+GEMINI_ON = os.environ.get('BVA_GEMINI', '1') == '1'
+_GEMINI_KEY = None
+def _gemini_key():
+    global _GEMINI_KEY
+    if _GEMINI_KEY is None:
+        try: _GEMINI_KEY = (ROOT / '.gemini-key').read_text().strip()
+        except Exception: _GEMINI_KEY = os.environ.get('BVA_GEMINI_KEY', '')
+    return _GEMINI_KEY
 _gpu_http = urllib.request.build_opener(urllib.request.ProxyHandler())
 _CONN_ERRORS = (http.client.RemoteDisconnected, ConnectionResetError, BrokenPipeError)
 def _remote_post(base, key, path, data, ctype, timeout):
@@ -116,6 +137,8 @@ def _gpu_post(path, data, ctype, timeout):
     return _remote_post(GPU_BASE, _gpu_key(), path, data, ctype, timeout)
 def _mini_post(path, data, ctype, timeout):
     return _remote_post(MINI_BASE, _mini_key(), path, data, ctype, timeout)
+def _gemini_post(path, data, ctype, timeout):
+    return _remote_post(GEMINI_BASE, _gemini_key(), path, data, ctype, timeout)
 class _GpuSeg:
     __slots__ = ('text', 'no_speech_prob', 'avg_logprob')
     def __init__(self, text): self.text, self.no_speech_prob, self.avg_logprob = text, 0.0, 0.0
@@ -213,6 +236,15 @@ try:
     _LLM_BACKEND = {'last': 'local'}
     def _remote_chat(post, model, messages):
         payload = {'model': model, 'messages': messages, 'max_tokens': 160, 'temperature': 0.3}
+        if 'gemini' in model:
+            # Hydrogen always thinks and thinking tokens count as
+            # output — 160 would starve the visible reply. chat_any
+            # caps the returned text anyway. Thinking must be LOW:
+            # at the default level a short voice reply took >30 s
+            # through this route and timed out (2026-11-19); low
+            # measured 10-16 s.
+            payload['max_tokens'] = 512
+            payload['reasoning_effort'] = 'low'
         if 'qwen3' in model:
             # Thinking MUST be off for voice turns: qwen3's reasoning
             # otherwise eats the whole token budget and the caller hears
@@ -221,8 +253,16 @@ try:
             payload['reasoning_effort'] = 'none'
         d = json.loads(post('/chat/completions', json.dumps(payload).encode(), 'application/json', 30))
         return (d['choices'][0]['message'].get('content') or '').strip()
-    def chat_any(messages, sentence_limit=1):
+    def chat_any(messages, sentence_limit=1, gemini_first=True):
         cap = 550 if sentence_limit > 1 else 300
+        if gemini_first and GEMINI_ON and _gemini_key():
+            try:
+                content = _remote_chat(_gemini_post, GEMINI_MODEL, messages)
+                if content:
+                    _LLM_BACKEND['last'] = 'gemini'
+                    return content[:cap]
+            except Exception as e:
+                print(f'[gemini] chat fallback: {e}', file=sys.stderr)
         if GPU_LLM and _gpu_key():
             try:
                 content = _remote_chat(_gpu_post, GPU_LLM_MODEL, messages)
@@ -419,7 +459,7 @@ def handle_request(req):
                 elif not beagle_topic(text,history) and not owner_allowed(trusted_peer):
                     reply=scope_redirect(text);result['replySource']='scope-redirect'
                 else:
-                    reply=finalize(chat_any(messages,sentence_limit=2 if story else 1));result['replySource']='local-model-grounded' if owner_allowed(trusted_peer) else 'local-model-public'
+                    reply=finalize(chat_any(messages,sentence_limit=2 if story else 1,gemini_first=(op=='chat')));result['replySource']='local-model-grounded' if owner_allowed(trusted_peer) else 'local-model-public'
                     call_id = req.get('callId')
                     recent = _last_reply.get(call_id) or []
                     if FAST and call_id and is_repeat_of_recent(recent, reply):
@@ -430,12 +470,19 @@ def handle_request(req):
                         # still repeats, break the loop with a brief
                         # acknowledgment instead of a third parroting.
                         nudged = [dict(messages[0], content=messages[0]['content'] + '\nIMPORTANT: your previous reply repeated your earlier answer word for word. Answer the caller\'s newest words directly, in a different way; never repeat that sentence.')] + messages[1:]
-                        retry = finalize(chat_any(nudged, sentence_limit=2 if story else 1))
+                        retry = finalize(chat_any(nudged, sentence_limit=2 if story else 1, gemini_first=(op=='chat')))
                         if is_repeat_of_recent(recent, retry):
                             reply = repeat_fallback(text); result['repeatGuard'] = 'fallback'
                         else:
                             reply = retry; result['repeatGuard'] = 'regenerated'
                 reply = finalize(reply)
+                if op == 'chat':
+                    # Typed text cannot be misheard (see grounding.py
+                    # text_reply_repair): a chat reply must never claim
+                    # a hearing failure, whatever the model produced.
+                    repaired = text_reply_repair(reply, text)
+                    if repaired != reply:
+                        reply = repaired; result['misheardGuard'] = 'text-fallback'
                 if req.get('callId') and reply:
                     _recent = _last_reply.setdefault(req['callId'], [])
                     _recent.append(reply); del _recent[:-3]

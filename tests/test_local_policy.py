@@ -124,6 +124,27 @@ class HearingClaimTests(unittest.TestCase):
         self.assertEqual(hearing_claim_repair('Beagle is a messenger with on-device identity.', 'what is beagle'),
                          'Beagle is a messenger with on-device identity.')
 
+class TextReplyRepairTests(unittest.TestCase):
+    def test_observed_misheard_line_becomes_snag(self):
+        from grounding import text_reply_repair
+        self.assertEqual(text_reply_repair('I may have misheard you — could you please repeat your question in one short sentence?',
+                                           'Why you send duplicated messages?'),
+                         'Sorry — I hit a snag answering that just now; please send it once more.')
+    def test_hearing_repair_line_also_caught(self):
+        from grounding import text_reply_repair
+        self.assertEqual(text_reply_repair("I'm here — I may have misheard that; could you say it once more, briefly?", 'hello'),
+                         'Sorry — I hit a snag answering that just now; please send it once more.')
+    def test_chinese_misheard_becomes_chinese_snag(self):
+        from grounding import text_reply_repair
+        self.assertEqual(text_reply_repair('我在，我可能听错了，请您简短再说一遍。', '你为什么重复发消息？'),
+                         '抱歉，我刚才回答时出了点问题，请再发一次。')
+    def test_normal_text_reply_untouched(self):
+        from grounding import text_reply_repair
+        self.assertEqual(text_reply_repair('Beagle is a messenger with on-device identity.', 'What is Beagle?'),
+                         'Beagle is a messenger with on-device identity.')
+        self.assertEqual(text_reply_repair('我再说一遍：Beagle 是端对端加密的。', '请重复一遍'),
+                         '我再说一遍：Beagle 是端对端加密的。')
+
 class IdentityTests(unittest.TestCase):
     def test_identity_intents(self):
         from grounding import identity_intent, identity_reply
